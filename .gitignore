@@ -1,0 +1,16 @@
+# 系统与临时文件
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Office 打开文件时的锁文件
+~$*
+
+# Python
+__pycache__/
+*.py[cod]
+
+# 运行时产物（核对表、副本、核查报告）
+out/
+*.docx
+!guo6-param-sheet-check/assets/*.docx
