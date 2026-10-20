@@ -8,10 +8,15 @@
 
 import re
 import zipfile
+from pathlib import Path
 from xml.etree import ElementTree as ET
 
 W = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
 DASH_SET = {'--', '---', '—', '——', '-', '－', '', '无'}
+
+
+class DocxError(Exception):
+    """文件不是可解析的 .docx：给人看得懂的提示，不抛栈。"""
 
 
 def normalize_label(text):
@@ -43,8 +48,17 @@ def _cell_text(tc):
 
 
 def _open_root(path):
-    with zipfile.ZipFile(path) as zf:
-        return ET.fromstring(zf.read('word/document.xml'))
+    try:
+        with zipfile.ZipFile(path) as zf:
+            data = zf.read('word/document.xml')
+    except zipfile.BadZipFile as exc:
+        raise DocxError(f'{Path(path).name} 不是有效的 .docx，可能是改了扩展名的 .doc，请用 WPS／Word 另存为 .docx') from exc
+    except KeyError as exc:
+        raise DocxError(f'{Path(path).name} 里没有 word/document.xml，不是 Word 文档') from exc
+    try:
+        return ET.fromstring(data)
+    except ET.ParseError as exc:
+        raise DocxError(f'{Path(path).name} 的 document.xml 无法解析，文件可能已损坏') from exc
 
 
 def read_tables(path):
@@ -61,7 +75,8 @@ def read_tables(path):
 
 
 def _pick_table(root, must_have):
-    for tbl in root.iter(W + 'tbl'):
+    """按文档中的出现顺序产出 (表序号, 行数据, 是否含速比)。"""
+    for idx, tbl in enumerate(root.iter(W + 'tbl')):
         rows = []
         has_ratio = False
         for tr in tbl.findall(W + 'tr'):
@@ -71,7 +86,7 @@ def _pick_table(root, must_have):
                 has_ratio = True
         joined = normalize_label(''.join(''.join(r) for r in rows))
         if all(normalize_label(k) in joined for k in must_have):
-            yield rows, has_ratio
+            yield idx, rows, has_ratio
 
 
 def parse_sectioned(path, must_have, sections):
@@ -79,11 +94,11 @@ def parse_sectioned(path, must_have, sections):
 
     返回 (pairs, positions)：
     - pairs: {(段名, 标签): 值}
-    - positions: {(段名, 标签): (行号, 单元格序号)}
+    - positions: {(段名, 标签): (表序号, 行号, 单元格序号)}
     """
     root = _open_root(path)
     want = {normalize_label(s) for s in sections}
-    for rows, _ in _pick_table(root, must_have):
+    for tbl_idx, rows, _ in _pick_table(root, must_have):
         pairs, positions = {}, {}
         section = ''
         for ri, cells in enumerate(rows):
@@ -108,12 +123,12 @@ def parse_sectioned(path, must_have, sections):
                 key = (section, label)
                 if key not in pairs:
                     pairs[key] = value
-                    positions[key] = (ri, ci + 1 + offset)
+                    positions[key] = (tbl_idx, ri, ci + 1 + offset)
             if '速比' in labels:
                 idx = labels.index('速比')
                 rest = [c.strip() for c in body[idx + 1:] if c.strip() and not is_dash(c)]
                 pairs[(section, '速比')] = ','.join(rest)
-                positions[(section, '速比')] = (ri, idx + 1 + offset)
+                positions[(section, '速比')] = (tbl_idx, ri, idx + 1 + offset)
         if pairs:
             return pairs, positions
     return {}, {}
@@ -187,10 +202,25 @@ def _set_cell_text(tc, value):
     t.text = value
 
 
+def _locate(tables, tbl_idx, row_idx, cell_idx, label=''):
+    """按表序号精确定位单元格，越界即报错，不做模糊匹配。"""
+    where = f'第{tbl_idx + 1}张表 第{row_idx + 1}行 第{cell_idx + 1}列{("（" + label + "）") if label else ""}'
+    if not 0 <= tbl_idx < len(tables):
+        raise ValueError(f'{where}：文档只有 {len(tables)} 张表，位置越界')
+    trs = tables[tbl_idx].findall(W + 'tr')
+    if not 0 <= row_idx < len(trs):
+        raise ValueError(f'{where}：该表只有 {len(trs)} 行，位置越界')
+    tcs = trs[row_idx].findall(W + 'tc')
+    if not 0 <= cell_idx < len(tcs):
+        raise ValueError(f'{where}：该行只有 {len(tcs)} 个单元格，位置越界')
+    return tcs[cell_idx], where
+
+
 def write_cells(src_path, dst_path, updates):
     """把 updates 写入 dst_path 副本。
 
-    updates: list[(行号, 单元格序号, 值)]
+    updates: list[(表序号, 行号, 单元格序号, 值)]，表序号由 parse_sectioned 给出。
+    先整体校验定位再写，越界直接报错；写完回读逐格核对，落错格子会抛错而不是静默成功。
     返回实际写入条数。
     """
     if str(src_path) == str(dst_path):
@@ -200,20 +230,23 @@ def write_cells(src_path, dst_path, updates):
         blobs = {n: zf.read(n) for n in names}
     root = ET.fromstring(blobs['word/document.xml'])
     tables = [t for t in root.iter(W + 'tbl')]
-    written = 0
-    for row_idx, cell_idx, value in updates:
-        for tbl in tables:
-            trs = tbl.findall(W + 'tr')
-            if row_idx >= len(trs):
-                continue
-            tcs = trs[row_idx].findall(W + 'tc')
-            if cell_idx >= len(tcs):
-                continue
-            _set_cell_text(tcs[cell_idx], value)
-            written += 1
-            break
+
+    targets = []
+    for tbl_idx, row_idx, cell_idx, value in updates:
+        tc, where = _locate(tables, tbl_idx, row_idx, cell_idx)
+        targets.append((tc, value, where))
+
+    for tc, value, _ in targets:
+        _set_cell_text(tc, value)
+
+    bad = [(where, _cell_text(tc), value) for tc, value, where in targets
+           if normalize_label(_cell_text(tc)) != normalize_label(value)]
+    if bad:
+        detail = '；'.join(f'{w} 写入后读回「{got}」，应为「{want}」' for w, got, want in bad[:5])
+        raise ValueError(f'回读校验失败，未生成副本：{detail}')
+
     blobs['word/document.xml'] = ET.tostring(root, encoding='UTF-8', xml_declaration=True)
     with zipfile.ZipFile(dst_path, 'w', zipfile.ZIP_DEFLATED) as out:
         for name in names:
             out.writestr(name, blobs[name])
-    return written
+    return len(targets)

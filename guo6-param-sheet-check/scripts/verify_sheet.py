@@ -88,13 +88,28 @@ def check_skip_fields(sheet, items, out):
 
 
 def check_manual_vs_report(sheet, items, out):
+    """人工字段与报告参考值比对，两份报告的参考值都要看。
+
+    依据文件不是报告的字段（底盘合格证、整车铭牌、公告等），报告值只是参考，
+    与表内不同属正常，按通过记录；只有依据指向报告的才当警告报出来。
+    """
     for it in items:
-        if it['status'] != '人工' or not it['source'].startswith('参考：'):
+        if it['status'] != '人工':
             continue
-        ref = it['source'][3:]
+        cands = [c['value'] for c in (it.get('ref_cands') or []) if c.get('value')]
+        if not cands:
+            continue
         got = get(sheet, it['section'], it['field'])
-        if got.strip() and dt.normalize_label(got) != dt.normalize_label(ref):
-            out.append((WARN, tag(it), f"表内「{got}」与报告参考「{ref}」不同，属人工判断项，请确认"))
+        if not got.strip():
+            continue
+        if any(dt.normalize_label(got) == dt.normalize_label(c) for c in cands):
+            continue
+        basis = (it.get('basis') or '').strip()
+        shown = it.get('ref_text') or ' / '.join(cands)
+        if basis and '报告' not in basis:
+            out.append((PASS, tag(it), f'按{basis}填「{got}」，与报告参考「{shown}」不同属正常'))
+        else:
+            out.append((WARN, tag(it), f"表内「{got}」与报告参考「{shown}」都不同，属人工判断项，请确认"))
 
 
 def check_vehicle_copy(sheet, items, out):
@@ -263,7 +278,15 @@ def main(argv=None):
         print('输入文件不存在', file=sys.stderr)
         return 2
 
-    sheet, _ = dt.parse_sectioned(args.sheet, ['车辆型号名称', '发动机型号'], SHEET_SECTIONS)
+    try:
+        sheet, positions = dt.parse_sectioned(args.sheet, ['车辆型号名称', '发动机型号'], SHEET_SECTIONS)
+    except dt.DocxError as exc:
+        print(f'读取失败：{exc}', file=sys.stderr)
+        return 3
+    if not positions:
+        print(f'参数表解析失败：{Path(args.sheet).name} 里找不到「段名/标签/值」结构的表格，'
+              '已停止核查，未生成核查报告。', file=sys.stderr)
+        return 3
     data = load_json(args.audit)
     items = data.get('items', [])
 

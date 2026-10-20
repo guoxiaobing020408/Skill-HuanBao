@@ -32,6 +32,9 @@ STATUS_SKIP = '不填'
 
 ENGINE_SECTIONS = {'发动机', '变速箱'}
 
+# 取数方式只允许这五个取值：排放=只查 A，噪声=只查 B，两款=两份都查，人工/不填=不取数
+KNOWN_SOURCES = ('排放', '噪声', '两款', '人工', '不填')
+
 
 def load_rules(path):
     rows = []
@@ -42,7 +45,10 @@ def load_rules(path):
 
 
 def load_report(path):
-    pairs, _ = dt.parse_sectioned(path, ['车辆型号名称', '发动机型号'], REPORT_SECTIONS)
+    """解析报告；读不出表格结构时返回 None，由调用方停下。"""
+    pairs, positions = dt.parse_sectioned(path, ['车辆型号名称', '发动机型号'], REPORT_SECTIONS)
+    if not positions:
+        return None
     data = dict(pairs)
     for key, val in dt.parse_contam(path).items():
         data.setdefault(key, val)
@@ -99,9 +105,42 @@ def main(argv=None):
             return 2
 
     rules = load_rules(args.rules)
-    sheet, positions = dt.parse_sectioned(args.sheet, ['车辆型号名称', '发动机型号'], SHEET_SECTIONS)
-    pm = load_report(args.pm)
-    zs = load_report(args.zs)
+    bad_source = [r for r in rules if r['取数方式'] not in KNOWN_SOURCES]
+    if bad_source:
+        for r in bad_source[:5]:
+            print(f"规则表取数方式不认识：「{r['取数方式']}」"
+                  f"（{r['参数表分段']}/{r['参数表字段']}）", file=sys.stderr)
+        print('只允许：排放 / 噪声 / 两款 / 人工 / 不填。未生成核对表。', file=sys.stderr)
+        return 4
+
+    try:
+        sheet, positions = dt.parse_sectioned(args.sheet, ['车辆型号名称', '发动机型号'], SHEET_SECTIONS)
+        pm = load_report(args.pm)
+        zs = load_report(args.zs)
+    except dt.DocxError as exc:
+        print(f'读取失败：{exc}', file=sys.stderr)
+        return 3
+
+    if not positions:
+        print(f'参数表解析失败：{Path(args.sheet).name} 里找不到「段名/标签/值」结构的表格。\n'
+              '检查是否为国六环保版参数表，或文件是否为改名的 .doc。未生成核对表。', file=sys.stderr)
+        return 3
+
+    failed = [name for name, data in (('排放视同报告', pm), ('噪声视同报告', zs)) if data is None]
+    if failed:
+        print(f'报告解析失败：{"、".join(failed)} 里读不出表格结构。\n'
+              '确认报告类型没搞反，文件不是改名的 .doc。未生成核对表。', file=sys.stderr)
+        return 3
+
+    matched = sum(1 for rule in rules
+                  if (dt.normalize_label(rule['参数表分段']), dt.normalize_label(rule['参数表字段'])) in positions)
+    if matched < len(rules) * 0.5:
+        print(f'参数表与规则表对不上：{len(rules)} 个字段只认出 {matched} 个，'
+              f'可能不是同一版参数表。未生成核对表。', file=sys.stderr)
+        return 3
+    if matched < len(rules):
+        print(f'提醒：{len(rules)} 个字段认出 {matched} 个，'
+              f'其余按「报告缺此项」列出，请确认参数表版本。', file=sys.stderr)
 
     items = []
     for rule in rules:
@@ -110,10 +149,12 @@ def main(argv=None):
         source = rule['取数方式']
         mode = rule['取值处理'] or 'value'
         note = rule['说明']
+        basis = (rule.get('依据文件') or '').strip()
         key = (dt.normalize_label(section), dt.normalize_label(field))
-        row, col = positions.get(key, ('', ''))
+        tbl, row, col = positions.get(key, ('', '', ''))
         current = sheet.get(key, '')
         value, used, status = '', '', STATUS_MANUAL
+        ref, ref_text, ref_cands = '', '', []
         cands = []
         texts = []
 
@@ -121,11 +162,11 @@ def main(argv=None):
             status = STATUS_SKIP
             used = '本表不填'
         elif source != '人工':
-            if source in ('排放', '两款', '自动'):
+            if source in ('排放', '两款'):
                 v = fetch(pm, rule['报告分段'], rule['报告字段'], mode)
                 if v not in (None, '', []):
                     cands.append(('pm', '排放报告', v))
-            if source in ('噪声', '两款', '自动'):
+            if source in ('噪声', '两款'):
                 v = fetch(zs, rule['报告分段'], rule['报告字段'], mode)
                 if v not in (None, '', []):
                     cands.append(('zs', '噪声报告', v))
@@ -144,9 +185,24 @@ def main(argv=None):
                 used = ' / '.join(f'{n}:{t}' for _, n, t in texts)
                 value = ''
         else:
-            ref = fetch(pm, rule['报告分段'], rule['报告字段'], mode) if rule['报告分段'] else None
-            if ref not in (None, '', []):
-                used = f"参考：{as_text(ref)}"
+            # 人工字段也要把两份报告的参考值都摆出来：只给一边会藏住另一边的口径差异
+            if rule['报告分段']:
+                for data, kind, name in ((pm, 'pm', 'A 排放'), (zs, 'zs', 'B 噪声')):
+                    v = fetch(data, rule['报告分段'], rule['报告字段'], mode)
+                    if v in (None, '', []):
+                        continue
+                    text = as_text(v)
+                    if text:
+                        ref_cands.append({'kind': kind, 'name': name, 'value': text})
+            if len({c['value'] for c in ref_cands}) == 1:
+                ref = ref_cands[0]['value']
+                ref_text = ref
+            elif ref_cands:
+                ref_text = ' / '.join(f"{c['name']}:{c['value']}" for c in ref_cands)
+            if basis:
+                used = f'依据：{basis}' + (f'（报告参考：{ref_text}）' if ref_text else '')
+            elif ref_text:
+                used = f'参考：{ref_text}'
 
         cmp_note = ''
         if value:
@@ -160,8 +216,13 @@ def main(argv=None):
             'source': used,
             'status': status,
             'note': note,
+            'basis': basis,
+            'ref': ref,
+            'ref_text': ref_text,
+            'ref_cands': ref_cands,
             'current': current,
             'compare': cmp_note,
+            'tbl': tbl,
             'row': row,
             'col': col,
             # 溯源信息：给「数据来源核对表」用
@@ -220,10 +281,12 @@ def render_md(meta, items):
     lines += ['', '## 二、待你填写的字段', '']
     manual = [i for i in items if i['status'] == STATUS_MANUAL]
     if manual:
-        lines.append('| 分段 | 字段 | 表内现值 | 怎么写 |')
-        lines.append('|---|---|---|---|')
+        lines.append('| 分段 | 字段 | 表内现值 | 依据文件 | 报告里的参考值 | 怎么写 |')
+        lines.append('|---|---|---|---|---|---|')
         for it in manual:
-            lines.append(f"| {it['section']} | {it['field']} | {it['current'] or '空'} | {it['note'] or '—'} |")
+            lines.append('| {s} | {f} | {c} | {b} | {r} | {n} |'.format(
+                s=it['section'], f=it['field'], c=it['current'] or '空',
+                b=it.get('basis') or '—', r=it.get('ref_text') or '—', n=it['note'] or '—'))
     else:
         lines.append('无')
     skipped = [i for i in items if i['status'] == STATUS_SKIP]

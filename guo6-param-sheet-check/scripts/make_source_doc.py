@@ -26,9 +26,12 @@ STATUS_ORDER = ['自动', '自动·待核对', '人工', '不填', '冲突待定
 
 
 def load_sheet(path):
+    """读参数表实际值；读不出来就报错，不拿核对表里的旧值冒充表内值。"""
     if not path:
         return None
-    pairs, _ = dt.parse_sectioned(path, ['车辆型号名称', '发动机型号'], SHEET_SECTIONS)
+    pairs, positions = dt.parse_sectioned(path, ['车辆型号名称', '发动机型号'], SHEET_SECTIONS)
+    if not positions:
+        raise dt.DocxError(f'{Path(path).name} 里找不到「段名/标签/值」结构的表格')
     return dict(pairs)
 
 
@@ -135,11 +138,12 @@ def build_out(data, sheet, vehicle, day):
         got = actual(sheet, it['section'], it['field'])
         shown = got if got is not None else it['current']
         rows.append([str(n), it['section'], it['field'], (shown or '').strip() or '空',
-                     it['note'] or '—'])
-    d.table(['#', '参数表分段', '参数表字段', '表内当前值', '怎么写'],
-            rows, widths=[430, 1500, 3200, 2400, 4800], size=17,
-            aligns=['center', 'left', 'left', 'left', 'left'])
-    d.p('这些格子本来就不该由系统填：要么报告里给的是基准车数据不能抄，要么必须看公告、铭牌、实车。',
+                     it.get('basis') or '—', it['note'] or '—'])
+    d.table(['#', '参数表分段', '参数表字段', '表内当前值', '依据文件', '怎么写'],
+            rows, widths=[380, 1400, 2900, 2100, 1900, 3900], size=17,
+            aligns=['center', 'left', 'left', 'left', 'left', 'left'])
+    d.p('「依据文件」写明这一格该去哪份材料上抄：底盘合格证、整车合格证/铭牌、公告或实车。'
+        '报告里同名字段是基准车数据，只能当参考，不能照抄。',
         size=18, color='7F7F7F')
 
     # 五、不一致
@@ -212,7 +216,11 @@ def main(argv=None):
         return 2
     data = json.loads(audit_path.read_text(encoding='utf-8'))
 
-    sheet = load_sheet(args.sheet) if args.sheet else None
+    try:
+        sheet = load_sheet(args.sheet) if args.sheet else None
+    except dt.DocxError as exc:
+        print(f'读取参数表失败：{exc}', file=sys.stderr)
+        return 3
     day = args.date or date.today().strftime('%Y年%m月%d日')
     out = Path(args.out) if args.out else audit_path.parent / '数据来源核对表.docx'
 

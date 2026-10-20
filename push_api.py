@@ -27,7 +27,7 @@ import urllib.request
 API = 'https://api.github.com'
 SKIP_DIRS = {'.git', '__pycache__', 'out', '.idea', '.vscode'}
 SKIP_FILES = {'.token', '.DS_Store', 'Thumbs.db', 'desktop.ini'}
-SKIP_SUFFIX = ('.pyc', '.pyo')
+SKIP_SUFFIX = ('.pyc', '.pyo', '.bak', '.tmp', '.swp')
 
 
 def token_path():

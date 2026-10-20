@@ -41,10 +41,10 @@ def main(argv=None):
         return 2
 
     items = load_items(args.audit)
-    index = {}
+    by_key, by_field = {}, {}
     for it in items:
-        index[(it['section'], it['field'])] = it
-        index.setdefault(it['field'], it)
+        by_key[(dt.normalize_label(it['section']), dt.normalize_label(it['field']))] = it
+        by_field.setdefault(dt.normalize_label(it['field']), []).append(it)
 
     overrides = {}
     for raw in args.set:
@@ -52,34 +52,61 @@ def main(argv=None):
             print(f'--set 参数格式不对：{raw}', file=sys.stderr)
             return 4
         key, value = raw.split('=', 1)
-        key = key.strip().replace('/', '\u0000')
-        target = None
-        if '\u0000' in key:
-            section, field = key.split('\u0000', 1)
-            target = index.get((section.strip(), field.strip()))
+        key = key.strip()
+        if '/' in key:
+            section, field = key.split('/', 1)
+            target = by_key.get((dt.normalize_label(section), dt.normalize_label(field)))
+            if target is None:
+                print(f'--set 找不到字段：{raw}（写成 参数表分段/参数表字段）', file=sys.stderr)
+                return 4
         else:
-            target = index.get(key)
-        if target is None:
-            print(f'--set 找不到对应字段：{raw}', file=sys.stderr)
+            hits = by_field.get(dt.normalize_label(key), [])
+            if not hits:
+                print(f'--set 找不到字段：{raw}', file=sys.stderr)
+                return 4
+            if len(hits) > 1:
+                names = '、'.join(f"{h['section']}/{h['field']}" for h in hits)
+                print(f'--set 字段「{key}」在多个分段重名，请写成 参数表分段/参数表字段，候选：{names}',
+                      file=sys.stderr)
+                return 4
+            target = hits[0]
+        if target['status'] == '不填':
+            print(f"--set 拒绝执行：「{target['section']}/{target['field']}」属本表不填项，不能赋值",
+                  file=sys.stderr)
             return 4
         overrides[(target['section'], target['field'])] = value.strip()
 
-    updates, skipped = [], []
+    updates, skipped, unlocated = [], [], []
     for it in items:
         key = (it['section'], it['field'])
+        has_pos = all(it.get(k) not in ('', None) for k in ('tbl', 'row', 'col'))
         if key in overrides:
-            updates.append((int(it['row']), int(it['col']), overrides[key], it))
+            if not has_pos:
+                unlocated.append(it)
+                continue
+            updates.append((int(it['tbl']), int(it['row']), int(it['col']), overrides[key], it))
             continue
-        if it['status'] in WRITABLE and it['value'] and it['row'] != '' and it['col'] != '':
-            updates.append((int(it['row']), int(it['col']), it['value'], it))
+        if not has_pos:
+            unlocated.append(it)
+            continue
+        if it['status'] in WRITABLE and it['value']:
+            updates.append((int(it['tbl']), int(it['row']), int(it['col']), it['value'], it))
         elif it['status'] in WRITABLE and not it['value']:
             skipped.append(it)
-        elif args.clear_manual and it['status'] == STATUS_MANUAL and it['row'] != '':
-            updates.append((int(it['row']), int(it['col']), '', it))
+        elif args.clear_manual and it['status'] == STATUS_MANUAL:
+            updates.append((int(it['tbl']), int(it['row']), int(it['col']), '', it))
 
     print(f'可写入 {len(updates)} 项，跳过 {len(skipped)} 项（判定为自动但没有取值）')
-    for row, col, value, it in updates:
-        print(f'  第{row + 1}行 第{col + 1}列  {it["section"]}/{it["field"]} = {value}')
+    for tbl, row, col, value, it in updates:
+        print(f'  表{tbl + 1} 第{row + 1}行 第{col + 1}列  {it["section"]}/{it["field"]} = {value}')
+
+    if unlocated:
+        print(f'\n有 {len(unlocated)} 项在参数表里找不到位置，未写入：', file=sys.stderr)
+        for it in unlocated[:10]:
+            print(f"  {it['section']}/{it['field']}", file=sys.stderr)
+        if 'tbl' not in unlocated[0]:
+            print('核对结果缺少表序号，请用当前版本的 build_audit.py 重新生成 audit.json。', file=sys.stderr)
+            return 5
 
     if not args.apply:
         print('\n预览模式，未写入任何文件。确认无误后加 --apply 生成副本：')
@@ -90,9 +117,16 @@ def main(argv=None):
         print(f'副本已存在：{args.out}\n如确需覆盖请加 --force。', file=sys.stderr)
         return 3
 
-    payload = [(r, c, v) for r, c, v, _ in updates]
-    written = dt.write_cells(args.sheet, args.out, payload)
-    print(f'已生成副本：{args.out}（写入 {written} 个单元格）')
+    payload = [(t, r, c, v) for t, r, c, v, _ in updates]
+    try:
+        written = dt.write_cells(args.sheet, args.out, payload)
+    except dt.DocxError as exc:
+        print(f'写表失败：{exc}', file=sys.stderr)
+        return 3
+    except ValueError as exc:
+        print(f'写表失败：{exc}', file=sys.stderr)
+        return 6
+    print(f'已生成副本：{args.out}（写入并回读校验 {written} 个单元格）')
     print('原件未改动。人工填写项请按核对表第二节补齐。')
     return 0
 

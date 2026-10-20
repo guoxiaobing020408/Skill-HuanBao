@@ -1,0 +1,16 @@
+# 缓存与编译产物
+__pycache__/
+*.py[cod]
+*.pyo
+
+# 本地备份与临时文件
+*.bak
+*.tmp
+~$*
+
+# 运行产物（每次核对都会重新生成，不入库）
+audit.md
+audit.json
+verify.md
+数据来源核对表*.docx
+*_样品参数表_*.docx
