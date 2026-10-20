@@ -17,7 +17,7 @@ echo.
 
 echo [1/3] Sync skill files from WorkBuddy ...
 if exist "%SRC%\SKILL.md" (
-    robocopy "%SRC%" "%DST%" /E /NFL /NDL /NJH /NJS /NP /XF *.pyc >nul
+    robocopy "%SRC%" "%DST%" /E /XD .git __pycache__ out /XF *.pyc *.pyo *.bak *.tmp /NFL /NDL /NJH /NJS /NP >nul
     if errorlevel 8 (
         echo   ERROR: robocopy failed. Abort.
         goto :end
