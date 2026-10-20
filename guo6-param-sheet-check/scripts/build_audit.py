@@ -114,32 +114,34 @@ def main(argv=None):
         row, col = positions.get(key, ('', ''))
         current = sheet.get(key, '')
         value, used, status = '', '', STATUS_MANUAL
+        cands = []
+        texts = []
 
         if source == '不填':
             status = STATUS_SKIP
             used = '本表不填'
         elif source != '人工':
-            cand = []
             if source in ('排放', '两款', '自动'):
                 v = fetch(pm, rule['报告分段'], rule['报告字段'], mode)
                 if v not in (None, '', []):
-                    cand.append(('排放报告', v))
+                    cands.append(('pm', '排放报告', v))
             if source in ('噪声', '两款', '自动'):
                 v = fetch(zs, rule['报告分段'], rule['报告字段'], mode)
                 if v not in (None, '', []):
-                    cand.append(('噪声报告', v))
-            texts = [(name, as_text(v)) for name, v in cand]
-            texts = [(n, t) for n, t in texts if t]
+                    cands.append(('zs', '噪声报告', v))
+            texts = [(k, n, as_text(v)) for k, n, v in cands]
+            texts = [t for t in texts if t[2]]
             if not texts:
                 status = STATUS_MISSING
-            elif len({t for _, t in texts}) == 1:
-                value, used = texts[0][1], texts[0][0]
+            elif len({t[2] for t in texts}) == 1:
+                value = texts[0][2]
+                used = texts[0][1]
                 if len(texts) == 2:
                     used = '两款报告一致'
                 status = STATUS_CHECK if dt.normalize_label(rule['报告分段']) in ENGINE_SECTIONS else STATUS_AUTO
             else:
                 status = STATUS_CONFLICT
-                used = ' / '.join(f'{n}:{t}' for n, t in texts)
+                used = ' / '.join(f'{n}:{t}' for _, n, t in texts)
                 value = ''
         else:
             ref = fetch(pm, rule['报告分段'], rule['报告字段'], mode) if rule['报告分段'] else None
@@ -162,6 +164,11 @@ def main(argv=None):
             'compare': cmp_note,
             'row': row,
             'col': col,
+            # 溯源信息：给「数据来源核对表」用
+            'src_kind': ''.join(t[0] for t in texts),
+            'src_section': rule['报告分段'],
+            'src_field': rule['报告字段'],
+            'src_cands': [{'kind': k, 'file': n, 'value': as_text(v)} for k, n, v in texts],
         })
 
     out = Path(args.out_dir)
@@ -170,6 +177,9 @@ def main(argv=None):
         'sheet': Path(args.sheet).name,
         'pm_report': report_id(args.pm),
         'zs_report': report_id(args.zs),
+        'sheet_file': Path(args.sheet).name,
+        'pm_file': Path(args.pm).name,
+        'zs_file': Path(args.zs).name,
         'total': len(items),
     }
     (out / 'audit.json').write_text(
