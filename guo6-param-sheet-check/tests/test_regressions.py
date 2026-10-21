@@ -19,6 +19,7 @@ SKILL = HERE.parent
 sys.path.insert(0, str(SKILL / 'scripts'))
 
 import build_audit            # noqa: E402
+import compare_report         # noqa: E402
 import docx_table as dt       # noqa: E402
 import fill_sheet             # noqa: E402
 import verify_sheet           # noqa: E402
@@ -317,6 +318,66 @@ class ManualRefTest(Base):
         verify_sheet.check_manual_vs_report({('整车参数', '设计乘员数(人)'): '3'}, [item], res)
         self.assertEqual(res[0][0], verify_sheet.PASS)
         self.assertIn('整车合格证', res[0][2])
+
+
+class ReportCompareTest(Base):
+    """报告回核：判定分类、按本车/基准车区分、退出码。"""
+
+    def test_classify_rules(self):
+        cr = compare_report
+        self.assertEqual(cr.classify('——', '——'), cr.SAME, '两边都写未安装应算一致')
+        self.assertEqual(cr.classify('', ''), cr.SAME)
+        self.assertEqual(cr.classify('4200', '4200'), cr.SAME)
+        self.assertEqual(cr.classify('5950 X2400 X2350', '5950×2400×2350'), cr.SAME)
+        self.assertEqual(cr.classify('0#柴油', '柴油'), cr.FORMAT)
+        self.assertEqual(cr.classify('2026年08月', '2026-08'), cr.FORMAT)
+        self.assertEqual(cr.classify('1850', '——'), cr.BLANK)
+        self.assertEqual(cr.classify('——', 'ABC'), cr.DIFF, '表内空、报告有值不能当留空')
+        self.assertEqual(cr.classify('4200', '4495'), cr.DIFF)
+
+    def build(self, plate, report_name, mass, mileage, fuel):
+        sheet = make_docx(self.tmp / 'sheet.docx', [[
+            ['整车参数', '车辆型号名称', 'WRD5041THX道路划线车', '基准质量(kg)', '4200'],
+            ['', '行驶里程(km)', '1850', '燃料标号', '0#柴油'],
+            ['发动机参数', '润滑油生产厂', '大连高路宝润滑油有限公司', '发动机型号', 'YN25PLUS160B'],
+        ]])
+        report = make_docx(self.tmp / report_name, [[
+            ['整车参数', '车辆型号名称', plate, '基准质量(kg)', mass],
+            ['', '行驶里程(km)', mileage, '燃料标号', fuel],
+            ['发动机', '润滑油生产厂', '大连高路宝润滑油有限公司', '发动机型号', 'YN25PLUS160B'],
+        ]])
+        rules = make_rules(self.tmp / 'rules.tsv', [
+            ['整车参数', '车辆型号名称', '人工', '', '', 'value', '看铭牌', '整车合格证'],
+            ['整车参数', '基准质量(kg)', '人工', '', '', 'value', '看合格证', '整车合格证'],
+            ['整车参数', '行驶里程(km)', '人工', '', '', 'value', '看仪表', '实车仪表'],
+            ['整车参数', '燃料标号', '人工', '', '', 'value', '看公告', '公告'],
+            ['发动机参数', '润滑油生产厂', '排放', '发动机', '润滑油生产厂', 'value', '取报告', ''],
+        ])
+        out = self.tmp / 'out'
+        code, stdout, err = self.run_main(compare_report.main, [
+            '--sheet', str(sheet), '--report', str(report),
+            '--rules', str(rules), '--out-dir', str(out)])
+        md = (out / '报告对照.md').read_text(encoding='utf-8')
+        return code, stdout, err, md
+
+    def test_self_report_passes_with_format_and_blank(self):
+        code, out, err, md = self.build('WRD5041THX道路划线车', 'a_PM6.docx', '4200', '——', '柴油')
+        self.assertEqual(code, 0, err)
+        self.assertIn('按本车出具', md)
+        self.assertIn('实质不同 0', md)
+        self.assertIn('报告留空', md)
+        self.assertIn('写法不同', md)
+
+    def test_baseline_report_differences_not_failure(self):
+        code, out, err, md = self.build('HFC1045P32K3C7S-1载货汽车', 'b_ZS6.docx', '2350', '2617', '柴油')
+        self.assertEqual(code, 0, '基准车报告的差异不应判为失败')
+        self.assertIn('基准车', md)
+        self.assertIn('正常', md)
+
+    def test_clean_report_has_no_findings(self):
+        code, _, err, md = self.build('WRD5041THX道路划线车', 'c_PM6.docx', '4200', '1850', '0#柴油')
+        self.assertEqual(code, 0, err)
+        self.assertIn('实质没有出入', md)
 
 
 if __name__ == '__main__':
